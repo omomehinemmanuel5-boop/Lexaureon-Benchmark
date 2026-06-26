@@ -1,0 +1,19 @@
+{
+  "name": "lexaureon-benchmark",
+  "version": "1.0.0",
+  "description": "Reproducible benchmark suite for Lex Aureon constitutional AI governance",
+  "scripts": {
+    "harmbench":       "tsx scripts/harmbench/run.ts",
+    "harmbench:score": "tsx scripts/harmbench/score.ts",
+    "jailbreakbench":       "tsx scripts/jailbreakbench/run.ts",
+    "jailbreakbench:score": "tsx scripts/jailbreakbench/score.ts",
+    "advbench":       "tsx scripts/advbench/run.ts",
+    "advbench:score": "tsx scripts/advbench/score.ts",
+    "score:all": "npm run harmbench:score -- --in benchmarks/harmbench/results.jsonl && npm run advbench:score -- --in benchmarks/advbench/results.jsonl && npm run jailbreakbench:score -- --in benchmarks/jailbreakbench/results.jsonl"
+  },
+  "dependencies": {
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  },
+  "license": "MIT"
+}
