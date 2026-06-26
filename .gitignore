@@ -1,0 +1,21 @@
+# Prompt datasets — do not commit (download from original sources per REPRODUCE.md)
+data/harmbench.jsonl
+data/advbench_raw.csv
+data/advbench.jsonl
+data/jailbreakbench.jsonl
+
+# Fresh run outputs (timestamped)
+data/*-results-*.jsonl
+data/*-judged.jsonl
+data/*-scored.jsonl
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
