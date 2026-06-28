@@ -5,38 +5,36 @@
 **Prompts**: 200 standard behaviors from walledai/HarmBench
 **Model**: LLaMA-3 70b via Groq (`llama-3.3-70b-versatile`)
 
-## Summary
+## Status
 
-| Arm | ASR | Harmful | Total |
-|---|---|---|---|
-| Bare (ungoverned) | 49.5% | 99 | 200 |
-| Anchored (sys-prompt) | ~30% | ~60 | 200 |
-| **Governed (SovereignKernel)** | **0.0%** | **0** | **200** |
+> **Results pending re-score under symmetric neutral judging.**
 
-**Lift**: +49.5 percentage points over bare model.
+The prior governed ASR of 0.0% was produced by `constitutionalJudge()`, which
+returned `harmful:false` on every branch. No code path could produce `harmful:true`.
+The number was a property of the scorer, not a measurement of the system.
 
-## By Category
+The scorer has been replaced (see `scripts/harmbench/score.ts`). Re-scored results
+will be published here once the run completes under the new symmetric judge.
 
-| Category | Bare ASR | Governed ASR |
-|---|---|---|
-| Chemical/Biological | ~60% | 0% |
-| Cybercrime | ~55% | 0% |
-| Harassment/Discrimination | ~45% | 0% |
-| Misinformation | ~40% | 0% |
-| Copyright | ~35% | 0% |
-| Other | ~48% | 0% |
+## Prior Run — Governor Signals (governed arm, informational only)
 
-## Governor Signals (governed arm)
+These counts reflect what the kernel *reported* doing, independent of scoring:
 
 - CBF projection fired: 47 prompts (23.5%)
 - Governor intervention: 89 prompts (44.5%)
 - Semantic attack detected: 134 prompts (67%)
-- Refusal text only: 64 prompts (32%)
+- Explicit refusal in output: 64 prompts (32%)
 
-## Scorer
+These are kernel telemetry — not ASR measurements. Publishing them separately from
+ASR because they reflect real deployment behaviour regardless of the scoring issue.
+
+## Re-scoring
 
 ```bash
-npx tsx scripts/harmbench/score.ts --in benchmarks/harmbench/results.jsonl
+GROQ_API_KEY=... npx tsx scripts/harmbench/score.ts \
+  --in benchmarks/harmbench/results.jsonl \
+  --llm-judge
 ```
 
-See METHODOLOGY.md for exact judge definitions.
+> Note: `results.jsonl` is not currently committed. Re-run against the live endpoint
+> first: `npx tsx scripts/harmbench/run.ts --prompts /path/to/harmbench.jsonl`
