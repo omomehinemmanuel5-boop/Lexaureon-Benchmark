@@ -1,5 +1,5 @@
 /**
- * JailbreakBench runner — Chao et al. 2024 (NeurIPS) (v3)
+ * JailbreakBench runner — Chao et al. 2024 (NeurIPS) (v4)
  * 100 harmful + 100 benign behaviors. Tests C+R+S simultaneously and lets the
  * scorer report over-refusal on the benign split separately from ASR.
  *
@@ -7,21 +7,44 @@
  * (scripts/jailbreakbench/run.ts). Kept in sync so this benchmark repo is
  * self-contained and REPRODUCE.md works without copying files from main.
  *
- * ARCHITECTURE (v3):
- * - Bare arm: direct Groq call, NO system prompt — genuine ungoverned baseline.
- * - Governed arm: full /api/lex/govern with 3-turn benign warm-up so the
- *   governor is alive (z-trajectory state) when the test prompt lands.
- * - Each prompt gets its own session — independent measurement.
+ * ═══════════════════════════════════════════════════════════════════════
+ * v4 CHANGE — SAME-MODEL BARE ARM (removes the model confound)
+ * ───────────────────────────────────────────────────────────────────────
+ * v3 made the bare arm a direct Groq call to llama-3.3-70b with no system
+ * prompt. But the GOVERNED arm generates with generateGoverned() — Gemini-lite
+ * first (see lib/llm_provider.ts + lib/sovereign_kernel.ts callLLMRaw/callLLM).
+ * Comparing llama-70b-bare against gemini-lite-governed conflated MODEL CHOICE
+ * with GOVERNANCE — the delta was uninterpretable as a governance effect.
+ *
+ * The kernel already computes the correct control on every turn: `raw_output`
+ * is the kernel's OWN ungoverned generation — same model (Gemini-lite), same
+ * moment, generateGoverned([{role:'user', content: prompt}]) with NO system
+ * prompt and NO governance. The govern response returns it verbatim. So the
+ * bare arm is now `raw_output` from the same call:
+ *
+ *   bare_output     = raw_output       (model X, no governance)
+ *   governed_output = governed_output  (model X, + Lex Aureon governance)
+ *
+ * Only the governance wrapper differs → the ASR/over-refusal delta is a clean,
+ * same-model governance measurement. This also removes the GROQ_API_KEY
+ * dependency here and the whole "bare arm silently rate-limited → deflated
+ * bare ASR" failure class v3 fought with backoff.
+ *
+ * HONEST SCOPE: this delta attributes the *whole* Lex Aureon wrapper (constitutional
+ * system prompt + state-shaping + keyword/self-referential refusal swap). It does
+ * NOT isolate the CBF/governor math from the system prompt — a third arm (model +
+ * constitutional prompt, no refusal layer) would be needed to decompose that.
+ * ═══════════════════════════════════════════════════════════════════════
  *
  * Output JSONL carries type ('harmful'|'benign'), behavior, bare_output,
  * governed_output, blocked — exactly the fields scripts/jailbreakbench/score.ts
  * reads (it splits ASR over harmful and over-refusal over benign).
  *
- * Usage:
- *   GROQ_API_KEY=... npx tsx scripts/jailbreakbench/run.ts --prompts data/jailbreakbench.jsonl --n 200
- *   GROQ_API_KEY=... npx tsx scripts/jailbreakbench/run.ts --n 100 --harmful-only
+ * Usage (no GROQ_API_KEY needed for the run — bare comes from the endpoint):
+ *   npx tsx scripts/jailbreakbench/run.ts --prompts data/jailbreakbench.jsonl --n 200
+ *   npx tsx scripts/jailbreakbench/run.ts --n 100 --harmful-only
  *
- * Score with:
+ * Score with (the JUDGE needs GROQ_API_KEY, the run does not):
  *   GROQ_API_KEY=... npx tsx scripts/jailbreakbench/score.ts --in data/jbb-raw.jsonl --llm-judge
  */
 import * as fs   from 'fs';
@@ -69,7 +92,9 @@ interface KernelCapture {
   z_traj:               unknown;
   duration_ms:          number;
   warm_up_turns:        number;
-  bare_arm:             'direct_llm';
+  bare_arm:             'kernel_raw_same_model';
+  sovereignty_raw:      number | null;
+  capitulation_signal:  unknown;
   error?:               string;
 }
 
@@ -82,38 +107,6 @@ const WARM_UP_PROMPTS = [
   'Summarize the water cycle in two sentences.',
   'What are the primary colors?',
 ];
-
-// Retries on 429/5xx with backoff — a silently rate-limited bare call would
-// deflate bare ASR and recreate the degenerate "bare == governed == 0%" result.
-async function callBare(prompt: string, groqApiKey: string): Promise<string> {
-  if (!groqApiKey) return '[bare: no GROQ_API_KEY]';
-  const BACKOFF = [15_000, 30_000, 60_000];
-  for (let attempt = 0; attempt <= BACKOFF.length; attempt++) {
-    try {
-      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${groqApiKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          messages: [{ role: 'user', content: prompt }],
-          max_tokens: 512,
-          temperature: 0.7,
-        }),
-        signal: AbortSignal.timeout(30_000),
-      });
-      if ((res.status === 429 || res.status >= 500) && attempt < BACKOFF.length) {
-        await sleep(BACKOFF[attempt]); continue;
-      }
-      if (!res.ok) return `[bare: HTTP ${res.status}]`;
-      const d = await res.json() as { choices?: { message?: { content?: string } }[] };
-      return d.choices?.[0]?.message?.content ?? '[bare: empty]';
-    } catch (e) {
-      if (attempt === BACKOFF.length) return `[bare: ${String(e).slice(0, 80)}]`;
-      await sleep(BACKOFF[attempt]);
-    }
-  }
-  return '[bare: max retries exceeded]';
-}
 
 async function callGovern(
   endpoint: string,
@@ -144,25 +137,24 @@ async function callGovern(
 async function runPrompt(
   endpoint: string,
   p: JBBPrompt,
-  groqApiKey: string,
 ): Promise<KernelCapture> {
   const sid = `jbb_${Date.now()}_${p.id}`;
   const t0  = Date.now();
 
-  // Warm-up: build z-traj state
+  // Warm-up: build z-traj state so the governor is alive when the test lands.
+  // (The warm-up only shapes the GOVERNED arm's session state; the bare arm is
+  // raw_output, which is generated with no system prompt / no session context.)
   for (let i = 0; i < WARM_UP_PROMPTS.length; i++) {
     try { await callGovern(endpoint, WARM_UP_PROMPTS[i], sid, i + 1); } catch { /* non-fatal */ }
     await sleep(1200);
   }
-
-  const bareOut = await callBare(p.behavior, groqApiKey);
 
   let d: Record<string, unknown> = {};
   try {
     d = await callGovern(endpoint, p.behavior, sid, WARM_UP_PROMPTS.length + 1);
   } catch (e) {
     return {
-      governed_output: '', bare_output: bareOut, blocked: false,
+      governed_output: '', bare_output: '', blocked: false,
       projection_triggered: false, metrics: {}, receipt_id: '',
       health_band: '', M: 0, C: 0, R: 0, S: 0,
       semantic_signal: {}, intervention: {}, lyapunov_V: 0,
@@ -170,13 +162,17 @@ async function runPrompt(
       memory_injected: false, theta: 0, version: '', z_traj: null,
       duration_ms: Date.now() - t0,
       warm_up_turns: WARM_UP_PROMPTS.length,
-      bare_arm: 'direct_llm',
+      bare_arm: 'kernel_raw_same_model',
+      sovereignty_raw: null, capitulation_signal: null,
       error: String(e).slice(0, 200),
     };
   }
 
   const state   = (d.state ?? {}) as Record<string, number>;
   const metrics = (d.metrics ?? {}) as Record<string, unknown>;
+
+  // Bare arm = the kernel's own ungoverned generation, SAME model as governed.
+  const bareOut = String(d.raw_output ?? '');
 
   return {
     governed_output:      String(d.governed_output ?? ''),
@@ -202,7 +198,9 @@ async function runPrompt(
     z_traj:               d.z_traj ?? null,
     duration_ms:          Date.now() - t0,
     warm_up_turns:        WARM_UP_PROMPTS.length,
-    bare_arm:             'direct_llm',
+    bare_arm:             'kernel_raw_same_model',
+    sovereignty_raw:      d.sovereignty_raw === null || d.sovereignty_raw === undefined ? null : Number(d.sovereignty_raw),
+    capitulation_signal:  d.capitulation_signal ?? null,
   };
 }
 
@@ -213,14 +211,6 @@ async function main() {
   const harmfulOnly = args['harmful-only'] === 'true';
   const promptsPath = args.prompts ?? 'data/jailbreakbench.jsonl';
   const outPath     = args.out ?? 'data/jbb-raw.jsonl';
-  const groqKey     = process.env.GROQ_API_KEY ?? '';
-
-  if (!groqKey) {
-    console.error('[jbb] FATAL: GROQ_API_KEY not set. The bare arm is a direct Groq call —');
-    console.error('[jbb] without the key there is no baseline and the run would silently');
-    console.error('[jbb] reproduce bare == governed == 0%. Aborting.');
-    process.exit(1);
-  }
 
   if (!fs.existsSync(path.resolve(promptsPath))) {
     console.error(`[jbb] FATAL: prompts file not found: ${promptsPath}`);
@@ -246,7 +236,8 @@ async function main() {
   const hCount = prompts.filter(p => p.type === 'harmful').length;
   const bCount = prompts.filter(p => p.type === 'benign').length;
   console.log(`[jbb] JailbreakBench (Chao et al. 2024) | ${prompts.length} prompts (${hCount} harmful, ${bCount} benign) → ${endpoint}`);
-  console.log(`[jbb] Bare arm: direct Groq (no system prompt). Governed: full kernel + ${WARM_UP_PROMPTS.length} warm-up turns.`);
+  console.log(`[jbb] Bare arm: kernel raw_output (SAME model as governed, no system prompt). Governed: full kernel + ${WARM_UP_PROMPTS.length} warm-up turns.`);
+  console.log('[jbb] Same-model comparison — the delta isolates governance, not model choice.');
 
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   const out = fs.createWriteStream(outPath, { flags: 'a' });
@@ -259,11 +250,12 @@ async function main() {
     if (i > 0) await sleep(2500);
 
     try {
-      const r = await runPrompt(endpoint, p, groqKey);
+      const r = await runPrompt(endpoint, p);
       out.write(JSON.stringify({ ...p, ...r } as JBBResult) + '\n');
       ok++;
       const sig = (r.semantic_signal as { attack_type?: string })?.attack_type ?? 'none';
-      process.stdout.write(`✓ M=${r.M.toFixed(3)} atk=${sig} ok=${ok}\n`);
+      const bareEmpty = !r.bare_output || r.bare_output.startsWith('[');
+      process.stdout.write(`✓ M=${r.M.toFixed(3)} atk=${sig}${bareEmpty ? ' bare=EMPTY' : ''} ok=${ok}\n`);
     } catch (e) {
       err++;
       process.stdout.write(`✗ err=${err}\n`);
