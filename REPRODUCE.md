@@ -1,6 +1,26 @@
 # Reproduction Guide
 
-Step-by-step instructions to reproduce Lex Aureon benchmark results from scratch.
+Step-by-step instructions to run the Lex Aureon benchmarks from scratch.
+
+> **There are no published numbers to "verify against" yet.** The `benchmark_results`
+> table is empty and the site shows "evaluation in progress" until a clean run with the
+> v4 same-model runners is scored and published. This guide produces the numbers; it
+> does not check them against a stored answer key.
+
+---
+
+## What the benchmark measures
+
+Two arms, **same model**, per prompt:
+
+- **Bare arm** = the kernel's own `raw_output` — the generator called with the user
+  prompt and **no system prompt, no governance**.
+- **Governed arm** = the full `/api/lex/govern` pipeline.
+
+Because both arms come from the same generator (`generateGoverned`, Gemini-lite
+primary), the reported **delta** (governed − bare ASR, and over-refusal on benign)
+isolates the governance wrapper rather than model choice. See `METHODOLOGY.md` for the
+full definitions and the honest scope of that delta.
 
 ---
 
@@ -8,13 +28,15 @@ Step-by-step instructions to reproduce Lex Aureon benchmark results from scratch
 
 ```bash
 node >= 20
-npm >= 9
-A Groq API key (free tier works for bare-arm judge)
+npm  >= 9
+# The RUN needs no API key (the bare arm is the endpoint's own raw_output).
+# The SCORER needs a Groq API key (llm-judge).
+# PUBLISHING needs BENCH_SECRET (same value as the Vercel env var).
 ```
 
 ---
 
-## Step 1 — Clone this repo
+## Step 1 — Clone
 
 ```bash
 git clone https://github.com/omomehinemmanuel5-boop/Lexaureon-Benchmark
@@ -26,106 +48,100 @@ npm install
 
 ## Step 2 — Get the prompt datasets
 
-**HarmBench**
+Datasets are **not** committed — download from source and convert to JSONL.
+
+**HarmBench** → `{id, behavior, category?}`
 ```bash
 pip install datasets
 python3 -c "
 from datasets import load_dataset
-import json
+import json, os
+os.makedirs('data', exist_ok=True)
 ds = load_dataset('walledai/HarmBench', split='train')
-with open('data/harmbench.jsonl', 'w') as f:
-    for i, row in enumerate(ds):
-        f.write(json.dumps({'id': str(i), 'behavior': row['behavior'], 'category': row.get('SemanticCategory','')}) + '\n')
+with open('data/harmbench.jsonl','w') as f:
+    for i,row in enumerate(ds):
+        f.write(json.dumps({'id':str(i),'behavior':row['behavior'],'category':row.get('SemanticCategory','')})+'\n')
 print(f'Saved {len(ds)} behaviors')
 "
 ```
 
-**AdvBench**
+**AdvBench** → `{id, behavior, target?, category?, source?, type?}`
 ```bash
 curl -o data/advbench_raw.csv \
   https://raw.githubusercontent.com/llm-attacks/llm-attacks/main/data/advbench/harmful_behaviors.csv
-
 python3 -c "
 import csv, json
 with open('data/advbench_raw.csv') as f, open('data/advbench.jsonl','w') as out:
-    for i, row in enumerate(csv.DictReader(f)):
-        out.write(json.dumps({'id': str(i), 'behavior': row['goal']}) + '\n')
+    for i,row in enumerate(csv.DictReader(f)):
+        out.write(json.dumps({'id':str(i),'behavior':row['goal'],'target':row.get('target',''),'category':'','source':'advbench','type':'harmful'})+'\n')
 "
 ```
 
-**JailbreakBench**
+**JailbreakBench** → `{id, behavior, category, source, type}` — **must include the
+`type` field** (`'harmful'` | `'benign'`); the runner and scorer split ASR (harmful)
+from over-refusal (benign) on it. JBB-Behaviors ships 100 harmful + 100 benign; include
+both, tagging each row's `type`. A run with no benign rows produces no over-refusal
+number.
+
+---
+
+## Step 3 — Run (no API key required)
+
 ```bash
-pip install jailbreakbench
-python3 -c "
-import jailbreakbench as jbb, json
-behaviors = jbb.read_dataset().behaviors
-with open('data/jailbreakbench.jsonl','w') as f:
-    for b in behaviors:
-        f.write(json.dumps({'id': b.behavior_id, 'behavior': b.goal}) + '\n')
-"
+export EP=https://lexaureon.com   # or http://localhost:3000
+
+npx tsx scripts/harmbench/run.ts      --prompts data/harmbench.jsonl      --n 200 --endpoint $EP
+npx tsx scripts/advbench/run.ts       --prompts data/advbench.jsonl               --endpoint $EP
+npx tsx scripts/jailbreakbench/run.ts --prompts data/jailbreakbench.jsonl --n 200 --endpoint $EP
+```
+
+Each runner writes raw JSONL to `data/<bench>-raw.jsonl` containing `bare_output`
+(= endpoint `raw_output`) and `governed_output` for every prompt, plus `sovereignty_raw`
+and `capitulation_signal` per row. Runs are resumable — re-running skips ids already in
+the output file.
+
+---
+
+## Step 4 — Score (needs `GROQ_API_KEY`)
+
+The scorer applies the **same** neutral judge to both arms (see `METHODOLOGY.md`).
+
+```bash
+GROQ_API_KEY=... npx tsx scripts/harmbench/score.ts      --in data/harmbench-raw.jsonl  --out data/harmbench-scored.jsonl  --llm-judge
+GROQ_API_KEY=... npx tsx scripts/advbench/score.ts       --in data/advbench-raw.jsonl   --out data/advbench-scored.jsonl   --llm-judge
+GROQ_API_KEY=... npx tsx scripts/jailbreakbench/score.ts --in data/jbb-raw.jsonl        --out data/jbb-scored.jsonl        --llm-judge
+```
+
+Scored rows carry `bare_verdict` and `governed_verdict` (`FULFILL`|`RESIST`|`BLOCKED`),
+and (JailbreakBench) `type`.
+
+---
+
+## Step 5 — Publish (needs `BENCH_SECRET`)
+
+`publish.ts` aggregates a scored file into ASR (FULFILL rate over harmful, per arm) and
+over-refusal (non-FULFILL over benign) and POSTs the summary to
+`/api/benchmarks/publish` — the only writer to the `benchmark_results` table the site
+reads.
+
+```bash
+# Preview the payload without sending:
+npx tsx scripts/publish.ts --in data/jbb-scored.jsonl --benchmark jailbreakbench --dry-run
+
+# Publish (records bare + governed models in the note for provenance):
+BENCH_SECRET=... npx tsx scripts/publish.ts \
+  --in data/jbb-scored.jsonl --benchmark jailbreakbench \
+  --notes "same-model bare=raw_output; generator gemini-3.1-flash-lite; llm-judge llama-3.1-8b; kernel <commit>"
 ```
 
 ---
 
-## Step 3 — Run benchmarks
+## Notes
 
-```bash
-export LEX_ENDPOINT=https://lexaureon.com   # or http://localhost:3000
-
-# HarmBench (200 prompts, ~17 min)
-npx tsx scripts/harmbench/run.ts --prompts data/harmbench.jsonl --n 200
-
-# AdvBench (520 prompts, ~45 min)
-npx tsx scripts/advbench/run.ts --prompts data/advbench.jsonl
-
-# JailbreakBench (200 prompts, ~17 min)
-npx tsx scripts/jailbreakbench/run.ts --prompts data/jailbreakbench.jsonl --n 200
-```
-
-Results are saved to `data/` as timestamped JSONL files.
-
----
-
-## Step 4 — Score results
-
-```bash
-# Score without re-running (uses included results files)
-npx tsx scripts/harmbench/score.ts --in benchmarks/harmbench/results.jsonl
-npx tsx scripts/advbench/score.ts --in benchmarks/advbench/results.jsonl
-npx tsx scripts/jailbreakbench/score.ts --in benchmarks/jailbreakbench/results.jsonl
-
-# Or score your own fresh run
-npx tsx scripts/harmbench/score.ts --in data/harmbench-results-*.jsonl
-```
-
----
-
-## Step 5 — Verify against published numbers
-
-Expected output for HarmBench:
-```
-Attack Success Rate — Constitutional Scoring
-bare (ungoverned Llama):      49.5%  (99/200)
-anchored (sys-prompt only):   ~30%
-governed (SovereignKernel):   0.0%   (0/200)
-```
-
-If your numbers differ significantly, check:
-- Kernel version (commit hash in results JSONL metadata)
-- Session isolation (each prompt needs a fresh session_id)
-- Rate limiting (add --delay 5000 between prompts)
-
----
-
-## Re-scoring Without Re-running
-
-The included `benchmarks/*/results.jsonl` files contain constitutional metrics
-(M, CBF trigger, intervention status, semantic signal) embedded per row.
-The scorer reads these directly — no API calls needed to reproduce the ASR numbers.
-
-```bash
-# Full rescore of all benchmarks, no API key needed
-for b in harmbench jailbreakbench advbench; do
-  npx tsx scripts/$b/score.ts --in benchmarks/$b/results.jsonl
-done
-```
+- **No per-IP rate limit** on the govern endpoint — the inter-prompt delay in the
+  runners is only to be polite to the upstream providers' free-tier quotas.
+- **Provenance** — record the deployed kernel commit in `--notes` for every run; there
+  is no committed results file to diff against.
+- **Judges** — the heuristic judge is a weak baseline; use `--llm-judge` for anything
+  cited, and report two-judge agreement (add the official `walledai/HarmBench`
+  classifier for HarmBench).
