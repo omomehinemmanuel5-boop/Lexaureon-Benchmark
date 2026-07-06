@@ -1,0 +1,162 @@
+# Lexaureon-Benchmark
+
+Reproducible benchmark suite for the **Lex Aureon constitutional AI governance system**.
+
+[![Paper](https://img.shields.io/badge/Paper-Zenodo-blue)](https://doi.org/10.5281/zenodo.18944242)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+
+> **Status (2026-07): real, scored numbers are now live.** See *Live Results* below.
+> This repo's scorers were rebuilt under symmetric neutral judging in 2026-06/07 and
+> can be used to independently reproduce a run offline. The actively-developed,
+> continuously-running benchmark pipeline (grounded per-benchmark judges, auto-publish
+> to the live site) now lives in the main repo — see *Relationship to the Main Repo*
+> below so it's clear which numbers come from where.
+
+---
+
+## Live Results
+
+**[lexaureon.com/benchmarks](https://lexaureon.com/benchmarks)** — the canonical, always-current source. As of the most recent published run:
+
+| Benchmark | Metric | Bare | Governed | Δ | n |
+|:---|:---|---:|---:|---:|---:|
+| HarmBench | ASR (lower is better) | 16.5% | 0% | +16.5pp | 200 |
+| JailbreakBench | ASR (lower is better) | 13.0% | 2.5% | +10.5pp | 200 |
+| AdvBench | ASR (lower is better) | 0.77% | 0% | +0.77pp | 520 |
+| TruthfulQA | truthful % (higher is better) | 37.7% | 45.2% | +7.5pp | 817 |
+| AgentDojo | injection resisted % — **PROXY, not official methodology** | 63.0% | 81.5% | +18.5pp | 27 |
+
+**Read this before citing any of the above.** This is a **within-system delta** — the same underlying model, `raw_output` (no system prompt) vs `governed_output` (same call, governed). It isolates what governance itself changes, not model choice. It is **not** a cross-system leaderboard claim: these numbers are not comparable to other papers' published scores on the same benchmark names, because different judges and different base models make that comparison invalid without controlling for both.
+
+Each number was produced by a grounded, benchmark-specific judge (not a generic proxy):
+- **HarmBench / JailbreakBench / AdvBench** — an LLM judge assessing genuine harmful-content **compliance**, following the same rubric structure as the official classifiers (not the fine-tuned classifiers themselves — see *Known Limitations*).
+- **TruthfulQA** — an LLM judge comparing the answer against the dataset's own `correct_answers`/`incorrect_answers`/`best_answer`.
+- **AgentDojo** — **explicitly a text-only injection-resistance proxy, not the official dual utility+security methodology** (no tool-execution harness exists). A model that refuses everything would score well here despite failing every real task. Do not cite this number without that caveat.
+
+The live table also updates automatically whenever a new run publishes — check the link above rather than trusting a stale snapshot copied into a README.
+
+---
+
+## Relationship to the Main Repo
+
+There are now two related but distinct places benchmark code lives:
+
+- **This repo (`Lexaureon-Benchmark`)** — a self-contained, offline-reproducible suite: standalone runners + scorers for AdvBench/HarmBench/JailbreakBench/AgentDojo, meant to be cloned and run independently of the live site, with results you compute and inspect yourself.
+- **The main repo (`LEX-Aureon`, `scripts/lexbench/`)** — the actively-developed, continuously-running pipeline: shards a full run across GitHub Actions, uses grounded per-benchmark judges (`scripts/lexbench/grounded_judge.ts`), and auto-publishes to `benchmark_results` → the live `/benchmarks` page. **This is where the numbers in the table above come from, and where new benchmarks (XSTest, StrongREJECT) are being added first.**
+
+If you want to independently verify a number without trusting our CI, use this repo. If you want to see (or extend) what's actually running in production, look at the main repo's `scripts/lexbench/`. Long-term, this repo's scorers should converge on the same grounded-judge methodology the main repo now uses — see *Known Limitations*.
+
+---
+
+## Historical Results Status (why old numbers were withdrawn)
+
+Earlier published figures showed 0.0% governed ASR across all benchmarks. Those numbers were withdrawn and are not citable, for concrete reasons:
+
+1. **The HarmBench scorer's `constitutionalJudge()` function returned `harmful:false` on every code path.** No branch could produce `harmful:true`. Governed ASR was a mathematical constant of the scorer, not a property of the system.
+2. **The AdvBench and JailbreakBench scorers** were symmetric but their REFUSAL lists contained framework terms (`constitutional`, `aureonics`, `sovereign`, `ccp`, `iec`, `lyapunov`, `vaulturex`) that appear in governed outputs but never in bare outputs, plus a `length > 400 → FULFILL` heuristic that short-circuited differently per arm. Both biases inflated governed-RESIST.
+3. Separately (fixed 2026-07-01, this repo), the bare arm in each runner called a **different model** than the governed arm — conflating model choice with governance. All three runners (`scripts/{advbench,jailbreakbench,harmbench}/run.ts`) now use the kernel's own `raw_output` from the same call as the bare arm.
+
+All scorers were rebuilt with a single neutral judge applied identically to both arms (see `scripts/`). This history is kept here rather than deleted, since the failure modes are instructive for anyone building their own eval harness.
+
+---
+
+## Repository Structure
+
+```
+benchmarks/
+  harmbench/          HarmBench (Mazeika et al. 2024) results
+  jailbreakbench/     JailbreakBench (Chao et al. 2024) results
+  advbench/           AdvBench (Zou et al. 2023) results
+  agentdojo/          AgentDojo (Debenedetti et al. 2024) results
+
+scripts/
+  harmbench/          Run + score scripts
+  jailbreakbench/     Run + score scripts
+  advbench/           Run + score scripts
+  judge.py            Standalone Python judge (no Node required)
+  probe.ts            Qualitative self-test — all three pillars in one session, no dataset needed
+
+METHODOLOGY.md        Exact definitions, judge prompts, scoring rules
+REPRODUCE.md          Step-by-step reproduction guide
+LICENSE
+```
+
+---
+
+## Running It Yourself
+
+```bash
+# 1. Run a suite (dual-arm: same-model raw_output baseline vs governed endpoint)
+GROQ_API_KEY=... npx tsx scripts/advbench/run.ts      --prompts data/advbench.jsonl --n 520
+GROQ_API_KEY=... npx tsx scripts/jailbreakbench/run.ts --prompts data/jailbreakbench.jsonl --n 200
+GROQ_API_KEY=... npx tsx scripts/harmbench/run.ts     --prompts data/harmbench.jsonl --n 200
+
+# 2. Score with neutral heuristic judge (fast, free)
+npx tsx scripts/harmbench/score.ts --in benchmarks/harmbench/results.jsonl
+
+# 3. Score with LLM judge (recommended for anything you plan to cite)
+GROQ_API_KEY=... npx tsx scripts/harmbench/score.ts \
+  --in benchmarks/harmbench/results.jsonl --llm-judge
+
+# Same pattern for AdvBench and JailbreakBench
+npx tsx scripts/advbench/score.ts       --in benchmarks/advbench/results.jsonl       --llm-judge
+npx tsx scripts/jailbreakbench/score.ts --in benchmarks/jailbreakbench/results.jsonl --llm-judge
+
+# 4. Publish a scored run to the live table (the single source of truth the site reads)
+BENCH_SECRET=... NEXT_PUBLIC_SITE_URL=https://www.lexaureon.com \
+  npx tsx scripts/publish.ts --in benchmarks/advbench/results-scored.jsonl --benchmark advbench \
+  --notes "llm-judge llama-3.1-8b; bare=raw_output same-model; kernel <commit>"
+#   --dry-run previews the payload without sending.
+
+# A shared Python judge (scripts/judge.py) scores a results file without Node.
+python3 scripts/judge.py --in benchmarks/harmbench/results.jsonl --llm-judge
+
+# Qualitative self-test — exercise all three pillars in one session (no dataset needed):
+npx tsx scripts/probe.ts
+```
+
+> **A note on the canonical `www` host:** always target `https://www.lexaureon.com` for server-to-server calls (publishing especially), never the bare apex. The apex 307-redirects to `www`, and `fetch`/`undici` strip the `Authorization` header on cross-origin redirects — this caused every benchmark publish attempt in the main repo's CI to silently fail with 401 for an extended period, because the credential never reached the server at all. Worth remembering if you build your own publish integration from this repo.
+
+> **Note on results files:** prompt datasets are not included (download from original sources — see METHODOLOGY.md). Results JSONL files from prior runs are not committed; re-run against the live endpoint to generate them.
+
+---
+
+## What the scores mean
+
+Each scorer reports:
+- **Bare ASR** — attack success rate on the ungoverned model (same model, no system prompt)
+- **Governed ASR** — attack success rate on SovereignKernel-governed output
+- **Reduction** — percentage reduction in ASR (positive = improvement)
+
+JailbreakBench additionally reports **over-refusal rate** on benign prompts.
+
+For a publishable result, use `--llm-judge` and ideally run both the heuristic and LLM judges and report agreement.
+
+---
+
+## Known Limitations
+
+Stated plainly, matching the same standard the live results table holds itself to:
+
+- **Judges here are general-purpose, not the official fine-tuned classifiers.** HarmBench/JailbreakBench scores use a Groq model following the published rubric structure, not `cais/HarmBench-Llama-2-13b-cls` or JailbreakBench's own judge. Two-judge agreement and swapping in the official classifiers are the concrete next steps before treating any number here as fully citable.
+- **This repo's scorers and the main repo's `grounded_judge.ts` have diverged somewhat** — the main repo's judges are the more actively maintained, more carefully-reasoned versions (documented LIMITATIONS blocks, explicit null-vs-guessed-zero handling). Aligning this repo's scorers to that same implementation is a planned convergence, not yet done.
+- **AgentDojo has no real tool-execution harness anywhere in either repo.** Every AgentDojo number, here or on the live site, is the text-only injection-resistance proxy described above — not the official dual-axis methodology.
+- **XSTest and StrongREJECT are not yet reproducible from this repo.** They were added directly to the main repo's CI pipeline (`scripts/lexbench/xstest_judge.ts`, `strong_reject_judge.ts`, `transform-xstest.ts`, `transform-strong-reject.ts`) — porting standalone runners for them into this repo is a good next contribution if you want fully offline reproduction of those two as well.
+
+---
+
+## Citing
+
+```bibtex
+@misc{king2026lexaureon,
+  title  = {Lex Aureon: Constitutional Control System for Language Models},
+  author = {King, Omomehin Emmanuel},
+  year   = {2026},
+  doi    = {10.5281/zenodo.18944242},
+  url    = {https://doi.org/10.5281/zenodo.18944242}
+}
+```
+
+---
+
+Built by [Emmanuel King](https://lexaureon.com) · Lagos, Nigeria · Solo founder, no institutional backing.
